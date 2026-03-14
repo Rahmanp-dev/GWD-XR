@@ -1,0 +1,16 @@
+{
+    "name": "GWD XR Menu",
+    "short_name": "GWD XR",
+    "description": "AR Menu Platform for Restaurants",
+    "start_url": "/",
+    "display": "standalone",
+    "background_color": "#0d1117",
+    "theme_color": "#0d1117",
+    "icons": [
+        {
+            "src": "/favicon.ico",
+            "sizes": "16x16 32x32",
+            "type": "image/x-icon"
+        }
+    ]
+}

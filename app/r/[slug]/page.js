@@ -1,7 +1,10 @@
 import { notFound } from 'next/navigation';
 import dbConnect from '@/lib/db';
 import Restaurant from '@/lib/models/Restaurant';
-import ARExperience from './ARExperience';
+import ARClientWrapper from './ARClientWrapper';
+
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
 
 export async function generateMetadata({ params }) {
     const { slug } = await params;
@@ -10,7 +13,7 @@ export async function generateMetadata({ params }) {
     if (!restaurant) return { title: 'Restaurant Not Found' };
     return {
         title: `${restaurant.name} – AR Menu | GWD XR`,
-        description: `View ${restaurant.name}'s menu in AR. See 3D food models on your real table.`,
+        description: `View ${restaurant.name} 's menu in AR. See 3D food models on your real table.`,
     };
 }
 
@@ -37,9 +40,19 @@ export default async function RestaurantPage({ params }) {
                 price: i.price,
                 icon: i.icon,
                 modelType: i.modelType,
+                modelUrl: i.modelUrl || '',
+                thumbnailUrl: i.thumbnailUrl || '',
                 scale: i.scale,
+                ingredients: i.ingredients || [],
+                tags: i.tags || [],
+                allergens: i.allergens || [],
+                spiceLevel: i.spiceLevel || 0,
+                calories: i.calories || 0,
+                prepTime: i.prepTime || '',
+                availability: i.availability || 'available',
+                reviews: { avgRating: i.reviews?.avgRating || 0, count: i.reviews?.count || 0 },
             })),
     };
 
-    return <ARExperience restaurant={data} />;
+    return <ARClientWrapper restaurant={data} />;
 }

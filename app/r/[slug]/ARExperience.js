@@ -2,6 +2,8 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import * as THREE from 'three';
+import { loadMenuItemModel, preloadModels } from '@/lib/model-loader';
+import { trackEvent } from '@/lib/analytics';
 
 /* ================================================================
    ARExperience – Production AR Menu (Complete Rewrite)
@@ -118,6 +120,7 @@ function createModel(type) {
     return g;
 }
 
+
 /* ── Bounce-in animation helper ────────────────────────────────── */
 function bounceIn(model, targetScale) {
     const start = performance.now(), dur = 500;
@@ -139,6 +142,18 @@ export default function ARExperience({ restaurant }) {
     /* ── State ──────────────────────────────────────────────── */
     const [phase, setPhase] = useState('consent');
     const [selectedItem, setSelectedItem] = useState(null);
+
+    // Track page views
+    useEffect(() => {
+        trackEvent(restaurant.slug, 'page_view');
+    }, [restaurant.slug]);
+
+    // Track dish views
+    useEffect(() => {
+        if (selectedItem) {
+            trackEvent(restaurant.slug, 'dish_view', selectedItem);
+        }
+    }, [selectedItem, restaurant.slug]);
     const [placedModels, setPlacedModels] = useState([]);
     const [cart, setCart] = useState([]);
     const [showCart, setShowCart] = useState(false);
@@ -147,6 +162,10 @@ export default function ARExperience({ restaurant }) {
     const [arMode, setArMode] = useState('desktop');
     const [errorMsg, setErrorMsg] = useState('');
     const [shiftHeld, setShiftHeld] = useState(false);
+    const [activeFilters, setActiveFilters] = useState([]);
+    const [showDishInfo, setShowDishInfo] = useState(null);
+    const [reviewRating, setReviewRating] = useState(0);
+    const [reviewSubmitted, setReviewSubmitted] = useState(false);
     const [needsHttps, setNeedsHttps] = useState(false);
 
     /* ── Refs ───────────────────────────────────────────────── */
@@ -339,6 +358,7 @@ export default function ARExperience({ restaurant }) {
        ══════════════════════════════════════════════════════════ */
 
     const startAR = useCallback(async () => {
+        trackEvent(restaurant.slug, 'ar_start', null, { mode: 'camera' });
         setPhase('loading'); setLoadProgress(10); setStatusMsg('Detecting AR capabilities…');
         initScene();
 
@@ -385,11 +405,11 @@ export default function ARExperience({ restaurant }) {
                 // XR Controller for tap-to-place
                 const ctrl = renderer.xr.getController(0);
                 sceneRef.current.add(ctrl);
-                ctrl.addEventListener('select', () => {
+                ctrl.addEventListener('select', async () => {
                     const item = selectedItemRef.current;
                     const reticle = reticleRef.current;
                     if (!item || !reticle || !reticle.visible) return;
-                    const model = createModel(item.modelType);
+                    const model = await loadMenuItemModel(item, createModel);
                     const scale = item.scale || 0.3;
                     model.position.setFromMatrixPosition(reticle.matrix);
                     model.scale.set(0, 0, 0);
@@ -517,6 +537,7 @@ export default function ARExperience({ restaurant }) {
     }, [initScene, initRenderer, startGyroscope, updateGyroCamera]);
 
     const startDesktopViewer = useCallback(() => {
+        trackEvent(restaurant.slug, 'ar_start', null, { mode: 'desktop' });
 
         setPhase('loading'); setLoadProgress(30); setStatusMsg('Loading 3D viewer…');
         initScene();
@@ -547,12 +568,13 @@ export default function ARExperience({ restaurant }) {
        MODEL PLACEMENT (button click)
        ══════════════════════════════════════════════════════════ */
 
-    const placeModel = useCallback(() => {
+    const placeModel = useCallback(async () => {
         if (!selectedItem) return;
+        trackEvent(restaurant.slug, 'dish_place', selectedItem);
         const scene = sceneRef.current;
         if (!scene) return;
 
-        const model = createModel(selectedItem.modelType);
+        const model = await loadMenuItemModel(selectedItem, createModel);
         const scale = selectedItem.scale || 0.3;
 
         if (arMode === 'webxr') {
@@ -578,7 +600,6 @@ export default function ARExperience({ restaurant }) {
         const autoRotate = arMode === 'desktop';
         modelsRef.current.push({ item: selectedItem, model, autoRotate });
         setPlacedModels(p => [...p, { id: Date.now(), item: selectedItem }]);
-        console.log('[AR] Placed:', selectedItem.modelType, 'mode:', arMode);
     }, [selectedItem, arMode]);
 
     /* ══════════════════════════════════════════════════════════
@@ -717,14 +738,48 @@ export default function ARExperience({ restaurant }) {
 
     const addToCart = useCallback(() => {
         if (!selectedItem) return;
+        trackEvent(restaurant.slug, 'cart_add', selectedItem);
         setCart(p => {
             const ex = p.find(c => c.id === selectedItem.id);
             if (ex) return p.map(c => c.id === selectedItem.id ? { ...c, quantity: c.quantity + 1 } : c);
             return [...p, { ...selectedItem, quantity: 1 }];
         });
-    }, [selectedItem]);
+        setShowCart(true);
+    }, [selectedItem, restaurant.slug]);
 
-    const removeFromCart = useCallback((id) => setCart(p => p.filter(c => c.id !== id)), []);
+    const removeFromCart = useCallback((id) => {
+        setCart(p => p.filter(c => c.id !== id));
+    }, []);
+
+    const handleShare = useCallback(async () => {
+        trackEvent(restaurant.slug, 'share');
+        if (!rendererRef.current || !sceneRef.current || !cameraRef.current) return;
+
+        try {
+            // Force a render to ensure canvas isn't clear
+            rendererRef.current.render(sceneRef.current, cameraRef.current);
+            const dataUrl = rendererRef.current.domElement.toDataURL('image/png');
+
+            const res = await fetch(dataUrl);
+            const blob = await res.blob();
+            const file = new File([blob], 'ar-dish.png', { type: 'image/png' });
+
+            const shareData = {
+                title: `${restaurant.name} AR Menu`,
+                text: `Check out the AR Menu at ${restaurant.name}!`,
+                files: [file]
+            };
+
+            if (navigator.canShare && navigator.canShare(shareData)) {
+                await navigator.share(shareData);
+            } else if (navigator.clipboard) {
+                await navigator.clipboard.writeText(`Check out ${restaurant.name}'s AR Menu at ${window.location.href}`);
+                alert('Link copied to clipboard! (Image sharing not supported on this browser)');
+            }
+        } catch (err) {
+            console.error('[AR] Share error:', err);
+        }
+    }, [restaurant]);
     const cartTotal = cart.reduce((s, c) => s + c.price * c.quantity, 0);
 
     const checkout = useCallback(async () => {
@@ -808,9 +863,14 @@ export default function ARExperience({ restaurant }) {
                         {name || 'GWD'} <span style={{ color: 'var(--color-primary)' }}>XR</span>
                         <span style={{ fontSize: '0.65rem', marginLeft: 8, padding: '2px 6px', background: 'rgba(0,240,255,0.15)', borderRadius: 4, color: 'var(--color-primary)', verticalAlign: 'middle' }}>{modeLabel}</span>
                     </div>
-                    <button className="btn btn-ghost btn-sm" onClick={() => setShowCart(true)} style={{ position: 'relative', backdropFilter: 'blur(10px)' }} data-ui="true">
-                        🛒 {cart.length > 0 && <span style={{ position: 'absolute', top: -6, right: -6, background: 'var(--color-accent)', color: '#fff', borderRadius: '50%', width: 20, height: 20, fontSize: '0.7rem', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700 }}>{cart.reduce((s, c) => s + c.quantity, 0)}</span>}
-                    </button>
+                    <div style={{ display: 'flex', gap: 10 }}>
+                        <button className="btn btn-ghost btn-sm" onClick={handleShare} style={{ padding: '0 12px', backdropFilter: 'blur(10px)' }} data-ui="true">
+                            📤 Share
+                        </button>
+                        <button className="btn btn-ghost btn-sm" onClick={() => setShowCart(true)} style={{ position: 'relative', backdropFilter: 'blur(10px)' }} data-ui="true">
+                            🛒 {cart.length > 0 && <span style={{ position: 'absolute', top: -6, right: -6, background: 'var(--color-accent)', color: '#fff', borderRadius: '50%', width: 20, height: 20, fontSize: '0.7rem', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700 }}>{cart.reduce((s, c) => s + c.quantity, 0)}</span>}
+                        </button>
+                    </div>
                 </div>
 
                 {/* Shift indicator */}
@@ -830,23 +890,83 @@ export default function ARExperience({ restaurant }) {
 
                 {/* Bottom: Carousel + Actions */}
                 <div style={{ pointerEvents: 'auto', padding: '0 12px 16px', background: 'linear-gradient(to top, rgba(0,0,0,0.5), transparent)' }} data-ui="true">
-                    <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 12, scrollSnapType: 'x mandatory', WebkitOverflowScrolling: 'touch', scrollbarWidth: 'none' }}>
-                        {menuItems.map(item => (
-                            <button key={item.id} onClick={() => setSelectedItem(item)} data-ui="true" style={{
-                                flex: '0 0 auto', scrollSnapAlign: 'center', width: 105, padding: '10px 6px',
-                                background: selectedItem?.id === item.id ? 'rgba(0,240,255,0.1)' : 'rgba(0,0,0,0.5)',
-                                border: selectedItem?.id === item.id ? '2px solid var(--color-primary)' : '1px solid rgba(255,255,255,0.1)',
-                                borderRadius: 12, cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4,
-                                color: 'var(--color-text)', backdropFilter: 'blur(12px)', transition: 'all 0.2s ease',
-                            }}>
-                                <span style={{ fontSize: '1.6rem' }}>{item.icon}</span>
-                                <span style={{ fontSize: '0.75rem', fontWeight: 500, lineHeight: 1.2 }}>{item.name}</span>
-                                <span style={{ fontSize: '0.7rem', color: 'var(--color-primary)', fontWeight: 600 }}>${item.price.toFixed(2)}</span>
-                            </button>
+
+                    {/* Allergen Filter Pills */}
+                    <div style={{ display: 'flex', gap: 6, overflowX: 'auto', paddingBottom: 8, scrollbarWidth: 'none' }}>
+                        {['gluten', 'dairy', 'nuts', 'vegan', 'vegetarian'].map(f => (
+                            <button key={f} data-ui="true" onClick={() => setActiveFilters(prev => prev.includes(f) ? prev.filter(x => x !== f) : [...prev, f])}
+                                style={{
+                                    flex: '0 0 auto', padding: '4px 10px', borderRadius: 16, fontSize: '0.7rem', fontWeight: 600,
+                                    border: activeFilters.includes(f) ? '1px solid var(--color-primary)' : '1px solid rgba(255,255,255,0.15)',
+                                    background: activeFilters.includes(f) ? 'rgba(0,240,255,0.15)' : 'rgba(0,0,0,0.3)',
+                                    color: activeFilters.includes(f) ? 'var(--color-primary)' : 'rgba(255,255,255,0.6)',
+                                    cursor: 'pointer', backdropFilter: 'blur(6px)', transition: 'all 0.2s',
+                                }}
+                            >{f === 'gluten' ? '🌾 No Gluten' : f === 'dairy' ? '🥛 No Dairy' : f === 'nuts' ? '🥜 No Nuts' : f === 'vegan' ? '🌱 Vegan' : '🥕 Vegetarian'}</button>
                         ))}
+                        {activeFilters.length > 0 && (
+                            <button data-ui="true" onClick={() => setActiveFilters([])} style={{ flex: '0 0 auto', padding: '4px 10px', borderRadius: 16, fontSize: '0.7rem', border: '1px solid rgba(255,100,100,0.3)', background: 'rgba(255,100,100,0.1)', color: '#ff6b6b', cursor: 'pointer' }}>✕ Clear</button>
+                        )}
                     </div>
+
+                    {/* Menu Carousel */}
+                    <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 12, scrollSnapType: 'x mandatory', WebkitOverflowScrolling: 'touch', scrollbarWidth: 'none' }}>
+                        {menuItems
+                            .filter(item => {
+                                if (activeFilters.length === 0) return true;
+                                // For 'vegan'/'vegetarian' filters: item must HAVE the allergen tag
+                                // For 'gluten'/'dairy'/'nuts': item must NOT have the allergen
+                                return activeFilters.every(f => {
+                                    if (f === 'vegan' || f === 'vegetarian') return (item.allergens || []).includes(f);
+                                    return !(item.allergens || []).includes(f);
+                                });
+                            })
+                            .map(item => {
+                                const isSelected = selectedItem?.id === item.id;
+                                const hasTags = item.tags && item.tags.length > 0;
+                                return (
+                                    <button key={item.id}
+                                        onClick={() => setSelectedItem(item)}
+                                        onDoubleClick={() => setShowDishInfo(item)}
+                                        data-ui="true"
+                                        style={{
+                                            flex: '0 0 auto', scrollSnapAlign: 'center', width: 110, padding: '8px 6px',
+                                            background: isSelected ? 'rgba(0,240,255,0.1)' : 'rgba(0,0,0,0.5)',
+                                            border: isSelected ? '2px solid var(--color-primary)' : '1px solid rgba(255,255,255,0.1)',
+                                            borderRadius: 12, cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
+                                            color: 'var(--color-text)', backdropFilter: 'blur(12px)', transition: 'all 0.2s ease',
+                                            position: 'relative',
+                                            opacity: item.availability === 'unavailable' ? 0.4 : 1,
+                                        }}
+                                    >
+                                        {/* Tags */}
+                                        {hasTags && (
+                                            <div style={{ position: 'absolute', top: -6, left: '50%', transform: 'translateX(-50%)', display: 'flex', gap: 2 }}>
+                                                {item.tags.includes('chef-pick') && <span style={{ background: '#f59e0b', color: '#000', padding: '1px 5px', borderRadius: 8, fontSize: '0.55rem', fontWeight: 700, whiteSpace: 'nowrap' }}>⭐ Chef</span>}
+                                                {item.tags.includes('popular') && <span style={{ background: '#ef4444', color: '#fff', padding: '1px 5px', borderRadius: 8, fontSize: '0.55rem', fontWeight: 700, whiteSpace: 'nowrap' }}>🔥 Hot</span>}
+                                                {item.tags.includes('new') && <span style={{ background: '#22c55e', color: '#fff', padding: '1px 5px', borderRadius: 8, fontSize: '0.55rem', fontWeight: 700, whiteSpace: 'nowrap' }}>✨ New</span>}
+                                            </div>
+                                        )}
+                                        <span style={{ fontSize: '1.5rem', marginTop: hasTags ? 4 : 0 }}>{item.icon}</span>
+                                        <span style={{ fontSize: '0.72rem', fontWeight: 500, lineHeight: 1.2, textAlign: 'center' }}>{item.name}</span>
+                                        <span style={{ fontSize: '0.68rem', color: 'var(--color-primary)', fontWeight: 600 }}>${item.price.toFixed(2)}</span>
+                                        {/* Bottom row: spice + rating */}
+                                        <div style={{ display: 'flex', gap: 4, alignItems: 'center', fontSize: '0.6rem' }}>
+                                            {item.spiceLevel > 0 && <span>{'🌶️'.repeat(Math.min(item.spiceLevel, 3))}</span>}
+                                            {item.reviews?.avgRating > 0 && <span style={{ color: '#fbbf24' }}>★{item.reviews.avgRating}</span>}
+                                        </div>
+                                    </button>
+                                );
+                            })
+                        }
+                    </div>
+
+                    {/* Actions */}
                     <div style={{ display: 'flex', gap: 10 }}>
                         <button className="btn btn-primary" disabled={!selectedItem} onClick={placeModel} style={{ flex: 1, opacity: selectedItem ? 1 : 0.5 }} data-ui="true">+ Place Item</button>
+                        {selectedItem && (
+                            <button className="btn btn-ghost" onClick={() => setShowDishInfo(selectedItem)} style={{ padding: '0 14px', backdropFilter: 'blur(10px)', border: '1px solid rgba(255,255,255,0.15)' }} data-ui="true">ℹ️</button>
+                        )}
                         <button className="btn btn-accent" disabled={!selectedItem} onClick={addToCart} style={{ flex: 1, opacity: selectedItem ? 1 : 0.5 }} data-ui="true">
                             Add to Cart{selectedItem ? ` $${selectedItem.price.toFixed(2)}` : ''}
                         </button>
@@ -858,6 +978,137 @@ export default function ARExperience({ restaurant }) {
                     </p>
                 </div>
             </div>
+
+            {/* ── DISH INFO PANEL ─────────────────────────── */}
+            {showDishInfo && (
+                <div data-ui="true" onClick={() => { setShowDishInfo(null); setReviewRating(0); setReviewSubmitted(false); }}
+                    style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 40, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}
+                >
+                    <div onClick={e => e.stopPropagation()} data-ui="true"
+                        style={{
+                            width: '100%', maxWidth: 440, maxHeight: '70vh', overflowY: 'auto',
+                            background: 'linear-gradient(135deg, rgba(15,23,42,0.98), rgba(30,41,59,0.98))',
+                            borderRadius: '20px 20px 0 0', padding: '20px 18px', backdropFilter: 'blur(20px)',
+                            border: '1px solid rgba(255,255,255,0.08)', borderBottom: 'none',
+                            animation: 'slideUp 0.3s ease-out',
+                        }}
+                    >
+                        {/* Drag handle */}
+                        <div style={{ width: 36, height: 4, background: 'rgba(255,255,255,0.2)', borderRadius: 2, margin: '0 auto 14px' }} />
+
+                        {/* Header */}
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
+                            <div>
+                                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
+                                    {showDishInfo.tags?.includes('chef-pick') && <span style={{ background: '#f59e0b', color: '#000', padding: '2px 8px', borderRadius: 10, fontSize: '0.65rem', fontWeight: 700 }}>⭐ Chef&apos;s Pick</span>}
+                                    {showDishInfo.tags?.includes('popular') && <span style={{ background: '#ef4444', color: '#fff', padding: '2px 8px', borderRadius: 10, fontSize: '0.65rem', fontWeight: 700 }}>🔥 Popular</span>}
+                                    {showDishInfo.tags?.includes('new') && <span style={{ background: '#22c55e', color: '#fff', padding: '2px 8px', borderRadius: 10, fontSize: '0.65rem', fontWeight: 700 }}>✨ New</span>}
+                                    {showDishInfo.tags?.includes('spicy') && <span style={{ background: '#dc2626', color: '#fff', padding: '2px 8px', borderRadius: 10, fontSize: '0.65rem', fontWeight: 700 }}>🌶️ Spicy</span>}
+                                    {showDishInfo.tags?.includes('healthy') && <span style={{ background: '#16a34a', color: '#fff', padding: '2px 8px', borderRadius: 10, fontSize: '0.65rem', fontWeight: 700 }}>💚 Healthy</span>}
+                                </div>
+                                <h3 style={{ fontSize: '1.15rem', fontWeight: 700, margin: 0 }}>{showDishInfo.icon} {showDishInfo.name}</h3>
+                            </div>
+                            <span style={{ fontSize: '1.2rem', fontWeight: 700, color: 'var(--color-primary)', whiteSpace: 'nowrap' }}>${showDishInfo.price.toFixed(2)}</span>
+                        </div>
+
+                        <p style={{ color: 'var(--color-text-secondary)', fontSize: '0.85rem', lineHeight: 1.5, margin: '0 0 14px' }}>{showDishInfo.description}</p>
+
+                        {/* Info chips */}
+                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>
+                            {showDishInfo.calories > 0 && (
+                                <span style={{ background: 'rgba(255,255,255,0.08)', padding: '4px 10px', borderRadius: 8, fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: 4 }}>🔥 {showDishInfo.calories} cal</span>
+                            )}
+                            {showDishInfo.prepTime && (
+                                <span style={{ background: 'rgba(255,255,255,0.08)', padding: '4px 10px', borderRadius: 8, fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: 4 }}>⏱️ {showDishInfo.prepTime}</span>
+                            )}
+                            {showDishInfo.spiceLevel > 0 && (
+                                <span style={{ background: 'rgba(255,255,255,0.08)', padding: '4px 10px', borderRadius: 8, fontSize: '0.75rem' }}>
+                                    {'🌶️'.repeat(showDishInfo.spiceLevel)} <span style={{ color: 'var(--color-text-muted)', marginLeft: 2 }}>{showDishInfo.spiceLevel}/5</span>
+                                </span>
+                            )}
+                            {showDishInfo.availability === 'limited' && (
+                                <span style={{ background: 'rgba(245,158,11,0.15)', color: '#f59e0b', padding: '4px 10px', borderRadius: 8, fontSize: '0.75rem', fontWeight: 600 }}>⚠️ Limited</span>
+                            )}
+                        </div>
+
+                        {/* Ingredients */}
+                        {showDishInfo.ingredients?.length > 0 && (
+                            <div style={{ marginBottom: 14 }}>
+                                <div style={{ fontSize: '0.7rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--color-text-muted)', marginBottom: 6 }}>Ingredients</div>
+                                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                                    {showDishInfo.ingredients.map((ing, i) => (
+                                        <span key={i} style={{ background: 'rgba(255,255,255,0.06)', padding: '3px 8px', borderRadius: 6, fontSize: '0.75rem' }}>{ing}</span>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Allergens */}
+                        {showDishInfo.allergens?.length > 0 && (
+                            <div style={{ marginBottom: 14 }}>
+                                <div style={{ fontSize: '0.7rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--color-text-muted)', marginBottom: 6 }}>Allergen Info</div>
+                                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                                    {showDishInfo.allergens.map((a, i) => (
+                                        <span key={i} style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.25)', color: '#fca5a5', padding: '3px 8px', borderRadius: 6, fontSize: '0.72rem' }}>⚠ {a}</span>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Reviews */}
+                        <div style={{ marginBottom: 14 }}>
+                            <div style={{ fontSize: '0.7rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--color-text-muted)', marginBottom: 6 }}>Reviews</div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                                <div style={{ fontSize: '1.5rem', fontWeight: 700, color: '#fbbf24' }}>
+                                    {showDishInfo.reviews?.avgRating?.toFixed(1) || '—'}
+                                </div>
+                                <div>
+                                    <div style={{ color: '#fbbf24', fontSize: '0.85rem' }}>
+                                        {'★'.repeat(Math.round(showDishInfo.reviews?.avgRating || 0))}{'☆'.repeat(5 - Math.round(showDishInfo.reviews?.avgRating || 0))}
+                                    </div>
+                                    <div style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)' }}>
+                                        {showDishInfo.reviews?.count || 0} reviews
+                                    </div>
+                                </div>
+                            </div>
+                            {/* Quick rate */}
+                            {!reviewSubmitted ? (
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                    <span style={{ fontSize: '0.75rem', color: 'var(--color-text-secondary)' }}>Rate:</span>
+                                    {[1, 2, 3, 4, 5].map(n => (
+                                        <button key={n} data-ui="true" onClick={() => setReviewRating(n)}
+                                            style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '1.2rem', color: n <= reviewRating ? '#fbbf24' : 'rgba(255,255,255,0.2)', transition: 'color 0.15s', padding: 2 }}
+                                        >{n <= reviewRating ? '★' : '☆'}</button>
+                                    ))}
+                                    {reviewRating > 0 && (
+                                        <button data-ui="true" className="btn btn-primary btn-sm"
+                                            onClick={async () => {
+                                                try {
+                                                    await fetch('/api/reviews', {
+                                                        method: 'POST',
+                                                        headers: { 'Content-Type': 'application/json' },
+                                                        body: JSON.stringify({ slug: restaurant.slug, itemId: showDishInfo.id, rating: reviewRating }),
+                                                    });
+                                                    setReviewSubmitted(true);
+                                                } catch (e) { console.error('[AR] Review error:', e); }
+                                            }}
+                                            style={{ fontSize: '0.72rem', padding: '3px 10px' }}
+                                        >Submit</button>
+                                    )}
+                                </div>
+                            ) : (
+                                <div style={{ color: '#22c55e', fontSize: '0.8rem', fontWeight: 600 }}>✓ Thanks for your review!</div>
+                            )}
+                        </div>
+
+                        {/* Actions */}
+                        <div style={{ display: 'flex', gap: 10, marginTop: 4 }}>
+                            <button className="btn btn-primary" data-ui="true" style={{ flex: 1 }} onClick={() => { setSelectedItem(showDishInfo); placeModel(); setShowDishInfo(null); }}>+ Place in AR</button>
+                            <button className="btn btn-accent" data-ui="true" style={{ flex: 1 }} onClick={() => { setSelectedItem(showDishInfo); addToCart(); setShowDishInfo(null); }}>Add to Cart</button>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* ── CART PANEL ───────────────────────────────── */}
             {showCart && (
